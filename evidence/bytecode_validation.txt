@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+    from bpfstrike.generator.payload_gen import PayloadGenerator
+ModuleNotFoundError: No module named 'bpfstrike.generator'
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    from bpfstrike.attacks.attack_gen import AttackGenerator
+ModuleNotFoundError: No module named 'bpfstrike.attacks.attack_gen'

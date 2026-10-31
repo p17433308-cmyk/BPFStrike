@@ -1,0 +1,434 @@
+BPFStrike: An eBPF Offensive Security Framework for Attack Simulation,
+Security Tool Evasion, and Kernel-Level Forensic Analysis
+
+Author: Dr. Sapna V M
+Source: https://github.com/p17433308-cmyk/BPFStrike
+Category: Offensive Security / Kernel Security
+Target Conference: Nullcon Goa 2027
+
+========================================================================
+1. ABSTRACT
+========================================================================
+
+BPFStrike is a comprehensive eBPF offensive security framework that
+generates real BPF bytecode for attack simulation, security tool
+evasion, kernel reconnaissance, forensic analysis, and verifier bypass
+research. Unlike existing BPF security tools that focus exclusively on
+defense, BPFStrike provides the attacker's perspective — generating
+valid eBPF programs that implement syscall hooking, process hiding,
+credential harvesting, XDP packet interception, container escape, and
+rootkit persistence techniques using actual BPF ISA instructions.
+
+The framework addresses a critical gap in eBPF security research: while
+tools like Falco, Tetragon, and Tracee use eBPF for monitoring, there
+is no systematic offensive toolkit for testing whether these defenses
+actually detect real BPF-based attacks. BPFStrike fills this gap with
+10 attack generators, 2 evasion modules, a full reconnaissance engine,
+a forensic analyzer with MITRE ATT&CK mapping, and a verifier bypass
+pattern database covering 6 historical CVEs.
+
+========================================================================
+2. INTRODUCTION
+========================================================================
+
+Extended Berkeley Packet Filter (eBPF) has evolved from a packet
+filtering mechanism into a general-purpose kernel execution engine.
+Modern Linux kernels (4.x+) allow unprivileged and privileged BPF
+programs to hook virtually any kernel function, intercept syscalls,
+modify network packets at the driver level, and attach to LSM hooks
+for security policy enforcement.
+
+This power makes eBPF an attractive attack vector. A compromised root
+account (or exploitation of unprivileged BPF on vulnerable kernels)
+enables loading BPF programs that:
+  - Hide processes from ps/top (getdents64 hooking)
+  - Intercept credentials (PAM/SSH hooking)
+  - Exfiltrate data via XDP or perf events
+  - Bypass container network policies (cgroup BPF)
+  - Hide themselves from bpftool enumeration
+  - Disable security tools by corrupting their BPF maps
+
+BPFStrike systematizes these techniques into a modular framework that
+generates real, loadable BPF bytecode for each attack.
+
+========================================================================
+3. TECHNICAL BACKGROUND
+========================================================================
+
+3.1 eBPF Instruction Set Architecture
+
+Every BPF instruction is 8 bytes:
+  [opcode:8][dst_reg:4][src_reg:4][offset:16][immediate:32]
+
+The ISA provides:
+  - 11 registers (R0-R10, where R10 is the read-only frame pointer)
+  - 64-bit arithmetic (ADD, SUB, MUL, DIV, AND, OR, XOR, LSH, RSH)
+  - Memory access (LDX, STX, ST for stack and map access)
+  - Conditional jumps (JEQ, JNE, JGT, JGE, JSGT, JSGE, JSET)
+  - Helper function calls (50+ kernel-provided functions)
+  - 32+ program types (kprobe, tracepoint, XDP, cgroup, LSM, etc.)
+  - 30+ map types (hash, array, ringbuf, perf_event_array, etc.)
+
+3.2 BPF Verifier
+
+Before any BPF program executes, the kernel verifier performs static
+analysis to ensure:
+  - No out-of-bounds memory access
+  - No infinite loops (DAG enforcement)
+  - No invalid pointer arithmetic
+  - No reading uninitialized memory
+  - Helper function arguments are type-safe
+
+The verifier has a state budget (1M states on modern kernels). Programs
+that exceed this budget are rejected. Historical CVEs demonstrate that
+the verifier can be bypassed through bounds confusion, dead code pruning
+exploitation, and speculative execution tricks.
+
+3.3 BPF Attack Surface
+
+The BPF subsystem presents multiple attack vectors:
+  - kprobe: Hook any kernel function, including syscall entry points
+  - tracepoint: Attach to static kernel instrumentation points
+  - XDP: Process packets before the network stack (driver level)
+  - cgroup_skb: Attach to cgroup network operations
+  - LSM: Override Linux Security Module policy decisions
+  - BPF iterators: Enumerate and hide BPF objects themselves
+
+========================================================================
+4. ARCHITECTURE
+========================================================================
+
+BPFStrike consists of six interconnected modules:
+
+4.1 Core Engine (bpfstrike/core/)
+  - bpf_bytecode.py: Complete eBPF ISA implementation
+    * All opcodes, register definitions, helper function enums
+    * Instruction builder functions (mov64_imm, ldx_mem, call_helper, etc.)
+    * BPFProgram class with bytecode generation and disassembly
+    * BPFMapDef for map definitions
+    * Complexity estimation for verifier state prediction
+  - elf_generator.py: Minimal ELF .o file generation
+    * Produces loadable objects for bpftool/libbpf
+    * Sections: .text (bytecode), maps, license, symtab, strtab
+    * Uses EM_BPF (machine type 247)
+    * SHA-256 hashing for program identification
+
+4.2 Attack Programs (bpfstrike/attacks/)
+  - 8 offensive BPF program generators, each producing real bytecode:
+    1. Syscall Hook: kprobe on sys_read, captures fd/buf/count via pt_regs
+    2. Process Hider: kprobe on sys_getdents64 with override_return
+    3. XDP Interceptor: Driver-level packet interception and port rewriting
+    4. Credential Harvester: kprobe on pam_sm_authenticate, ringbuf exfil
+    5. Container Escape: cgroup_skb to bypass Docker network policies
+    6. File Hider: tracepoint on sys_exit_getdents64
+    7. Keylogger: tracepoint on sys_enter_write, TTY fd filtering
+    8. BPF Self-Hider: BPF iterator abuse to hide from bpftool
+
+4.3 Security Tool Evasion (bpfstrike/evasion/)
+  - Signature database for Falco, Tetragon, Tracee, bpftrace
+  - io_uring-based evasion (bypasses all tracepoint monitoring)
+  - Map corruption attack (disable security rules without removing tools)
+  - Alternative syscall database (unmonitored equivalents)
+
+4.4 Reconnaissance (bpfstrike/recon/)
+  - BPFScanner class for kernel BPF capability enumeration
+  - Reads /proc/sys/kernel/ sysctl settings
+  - Parses bpftool prog/map JSON output
+  - Suspicion scoring for loaded programs
+  - Security tool detection from program/map signatures
+  - Attack surface scoring (0-100)
+
+4.5 Forensic Analysis (bpfstrike/forensics/)
+  - Static bytecode analysis for malicious BPF detection
+  - 7 suspicious helper pattern combinations (credential theft, process
+    hiding, network exfil, data exfil, syscall tampering, persistence,
+    signal injection)
+  - 11 suspicious attach points with MITRE ATT&CK mapping
+  - Program type risk assessment
+  - Batch analysis with risk-sorted reports
+
+4.6 Verifier Bypass Patterns (bpfstrike/verifier/)
+  - 6 historical CVEs (CVE-2021-3490, CVE-2021-31440, CVE-2022-23222,
+    CVE-2023-2163, CVE-2023-39191, CVE-2024-2193)
+  - Complexity bomb generator (exponential state explosion)
+  - ALU32 bounds confusion pattern (CVE-2021-3490)
+  - Pointer arithmetic confusion pattern (CVE-2022-23222)
+
+========================================================================
+5. ATTACK PROGRAMS — DETAILED ANALYSIS
+========================================================================
+
+5.1 Syscall Hook (T1059)
+  Attaches a kprobe to __x64_sys_read. Reads pt_regs to extract
+  fd (di), buffer pointer (si), and count (dx). Uses perf_event_output
+  for exfiltration. The bytecode captures every read() syscall including
+  file operations, network receives, and IPC.
+
+5.2 Process Hider (T1564.001)
+  Hooks __x64_sys_getdents64 with override_return. When a target PID's
+  directory entry appears in /proc, the override forces the syscall to
+  return a modified count, effectively removing the entry. Tools like
+  ps, top, and htop rely on getdents64 for /proc enumeration.
+
+5.3 XDP Interceptor (T1557)
+  An XDP program that parses Ethernet, IPv4, and TCP headers in
+  bytecode. Performs destination port rewriting based on a BPF hash map
+  lookup. Operates at the driver level, before iptables/nftables, making
+  it invisible to standard network monitoring.
+
+5.4 Credential Harvester (T1056.001)
+  Hooks pam_sm_authenticate — the core PAM authentication function
+  called by sudo, su, SSH, and login. Captures PID, UID, timestamp,
+  and process name via get_current_comm. Exfiltrates via ringbuf for
+  zero-copy efficiency.
+
+5.5 Container Escape (T1611)
+  Attaches to the Docker cgroup via cgroup_skb. Bypasses container
+  network policies by operating at the BPF level, below the container
+  runtime's enforcement. Enables network traffic that the container
+  policy explicitly denies.
+
+5.6 File Hider (T1564.001)
+  Uses a tracepoint on sys_exit_getdents64 to filter directory listing
+  results after the syscall completes. Matches filenames against a
+  BPF hash map and removes matching entries from the dirent buffer.
+
+5.7 Keylogger (T1056.001)
+  Tracepoint on sys_enter_write that filters for TTY file descriptors
+  (fd 0, 1, 2 and /dev/tty*). Captures keystroke data from terminal
+  sessions including passwords typed at prompts.
+
+5.8 BPF Self-Hider (T1014)
+  Abuses the BPF program iterator (bpf_prog type) to filter the list
+  of loaded BPF programs. When bpftool or /proc/sys/net/bpf enumerates
+  programs, this iterator hides specified program IDs, making the
+  rootkit invisible to BPF-aware administrators.
+
+========================================================================
+6. SECURITY TOOL EVASION
+========================================================================
+
+6.1 io_uring Bypass
+
+io_uring is the most effective eBPF security tool bypass discovered to
+date. io_uring operations execute in kernel worker threads via
+submission/completion queues, completely bypassing tracepoint-based and
+kprobe-based syscall monitoring.
+
+Affected tools: Falco, Tetragon (partial), Tracee (partial), sysdig
+
+Bypassed operations:
+  - IORING_OP_OPENAT: open files without sys_openat
+  - IORING_OP_READ: read files without sys_read
+  - IORING_OP_WRITE: write files without sys_write
+  - IORING_OP_CONNECT: connect sockets without sys_connect
+  - IORING_OP_ACCEPT: accept connections without sys_accept
+  - IORING_OP_SENDMSG: send data without sys_sendmsg
+  - IORING_OP_RECVMSG: receive data without sys_recvmsg
+  - IORING_OP_UNLINKAT: delete files without sys_unlinkat
+  - IORING_OP_RENAMEAT: rename files without sys_renameat
+
+Related CVEs: CVE-2023-2598, CVE-2024-0582
+
+6.2 Map Corruption
+
+Security tools store their detection rules, configuration, and state
+in BPF maps. An attacker with CAP_BPF can:
+  1. Enumerate maps owned by security tools (by signature matching)
+  2. Open target maps by ID via the bpf() syscall
+  3. Overwrite or delete specific entries to disable detection rules
+  4. The security tool continues running but specific rules are silently
+     disabled
+
+BPFStrike identifies security tool maps by name patterns and generates
+programs to monitor and manipulate BPF map operations.
+
+========================================================================
+7. RECONNAISSANCE ENGINE
+========================================================================
+
+The BPFScanner performs systematic BPF subsystem enumeration:
+
+  1. Kernel capabilities: version, sysctl settings, available features
+  2. Program enumeration: parse bpftool output, flag suspicious programs
+  3. Map enumeration: identify security tool maps, large maps, frozen maps
+  4. Security tool detection: signature-match Falco, Tetragon, Tracee,
+     bpftrace from program names and map names
+  5. Attack surface scoring: 0-100 composite score based on:
+     - BPF enabled (+20)
+     - Unprivileged BPF (+30)
+     - JIT enabled without hardening (+15)
+     - Ringbuf available (+10)
+     - BPF LSM available (+10)
+     - kprobe available (+10)
+     - XDP available (+5)
+
+Suspicion indicators for loaded programs:
+  - Name contains rootkit-related keywords
+  - Root-owned kprobe/tracing without known system owner
+  - Unusually large bytecode (>50KB)
+  - Many maps attached (>10)
+
+========================================================================
+8. FORENSIC ANALYSIS
+========================================================================
+
+The BPFForensicAnalyzer performs static analysis of BPF bytecode to
+detect malicious behavior without executing the program.
+
+Detection methods:
+  1. Helper pattern analysis: 7 suspicious helper combinations
+     - Credential theft: probe_read + get_current_comm + perf_event_output
+     - Process hiding: override_return + get_current_pid_tgid
+     - Network exfil: skb_store_bytes + redirect
+     - Data exfil: ringbuf_reserve + ringbuf_submit + probe_read
+     - Syscall tampering: override_return (any context)
+     - Persistence: tail_call chaining
+     - Signal injection: send_signal + pid targeting
+
+  2. Attach point analysis: 11 high-risk kernel functions
+     - __x64_sys_getdents64: process/file hiding
+     - pam_sm_authenticate: credential harvesting
+     - __x64_sys_bpf: BPF self-hiding
+     - security_bprm_check: execution control
+
+  3. Program type risk scoring:
+     - Critical: kprobe, tracing
+     - High: XDP, LSM
+     - Medium: cgroup, tracepoint
+
+  4. Bytecode anomaly detection:
+     - Size anomalies (>1000 instructions)
+     - override_return usage (rootkit indicator)
+
+Risk computation: weighted severity * confidence scoring, producing
+overall risk ratings of critical, high, medium, or low.
+
+========================================================================
+9. VERIFIER BYPASS RESEARCH
+========================================================================
+
+9.1 CVE Database
+
+BPFStrike catalogs 6 historical BPF verifier bypass CVEs:
+
+CVE-2021-3490 (CVSS 7.8): ALU32 bounds tracking confusion. 32-bit
+  operations don't properly update 64-bit range tracking.
+  Kernels 5.7-5.11.
+
+CVE-2021-31440 (CVSS 7.0): 32-bit register spill/fill bypass.
+  Incorrect handling of register save/restore confuses range tracking.
+  Kernels 5.7-5.10.
+
+CVE-2022-23222 (CVSS 7.8): Pointer arithmetic confusion. Large add/sub
+  operations cause the verifier to lose pointer type information.
+  Kernels 5.8-5.16.
+
+CVE-2023-2163 (CVSS 8.8): Dead code pruning bypass. The verifier's
+  dead code elimination can be tricked into removing safety checks.
+  Kernels 5.4-6.3.
+
+CVE-2023-39191 (CVSS 8.2): Precision tracking overflow. Scalar value
+  precision tracking can overflow, accepting OOB access programs.
+  Kernels 5.13-6.4.
+
+CVE-2024-2193 (CVSS 5.5): Spectre-BPF. Speculative execution in the
+  BPF JIT bypasses verifier type checks. Kernels 4.15-6.7.
+
+9.2 Complexity Bomb
+
+Generates a BPF program with 20 random conditional branches, creating
+2^20 potential verifier states. Approaches the 1M state budget on
+modern kernels. This is not a vulnerability — it is an inherent limit
+of static analysis.
+
+9.3 Bypass Pattern Generators
+
+Each generator produces a BPFProgram with real instructions
+demonstrating the vulnerability pattern. Programs are annotated with
+CVE references, affected kernel versions, and patch status.
+
+========================================================================
+10. MITRE ATT&CK MAPPING
+========================================================================
+
+BPFStrike maps all attack programs to MITRE ATT&CK techniques:
+
+  T1014   — Rootkit (process hiding, BPF self-hiding)
+  T1048   — Exfiltration Over Alternative Protocol (XDP, perf)
+  T1056.001 — Keylogging / Credential Harvesting
+  T1059   — Command and Scripting Interpreter (syscall hooking)
+  T1489   — Service Stop (signal injection)
+  T1547   — Boot or Logon Autostart Execution (tail call persistence)
+  T1557   — Adversary-in-the-Middle (XDP interception)
+  T1562.001 — Impair Defenses: Disable or Modify Tools
+  T1564.001 — Hide Artifacts: Hidden Files and Directories
+  T1611   — Escape to Host (container escape)
+
+========================================================================
+11. ELF GENERATION
+========================================================================
+
+BPFStrike generates minimal ELF relocatable objects (.o files) that
+can be loaded by bpftool, libbpf, or cilium/ebpf. The ELF format:
+
+  - ELF header: EM_BPF (247), ELFCLASS64, little-endian
+  - .text section: Raw BPF bytecode
+  - maps section: BPF map definitions (type, key_size, value_size,
+    max_entries for each map)
+  - license section: "GPL" (required for many helpers)
+  - .symtab: Symbol table with program entry point
+  - .strtab: String table for symbol names
+  - .shstrtab: Section header string table
+
+Each generated ELF is accompanied by a SHA-256 hash for forensic
+identification and chain-of-custody tracking.
+
+========================================================================
+12. USAGE AND CLI
+========================================================================
+
+BPFStrike provides a command-line interface with five subcommands:
+
+  bpfstrike generate [attack] [--disasm] [-o DIR] [--json]
+    Generate offensive BPF programs. Supports individual attack selection
+    or 'all' for the complete arsenal. --disasm shows bytecode
+    disassembly. -o saves ELF and raw bytecode files.
+
+  bpfstrike recon [--bpftool-progs FILE] [--bpftool-maps FILE] [--json]
+    Enumerate BPF subsystem capabilities. Optionally parse bpftool JSON
+    output for loaded program and map analysis.
+
+  bpfstrike forensics [--bytecode-file FILE] [-o FILE]
+    Detect malicious BPF programs. Analyzes raw bytecode or runs pattern
+    detection against all known attack types.
+
+  bpfstrike verifier [pattern] [--list-cves] [--disasm]
+    Explore verifier bypass patterns and the CVE database.
+
+  bpfstrike demo
+    Full demonstration: recon, attack generation, ELF creation, forensic
+    analysis, and verifier bypass patterns.
+
+========================================================================
+13. CONCLUSION
+========================================================================
+
+BPFStrike demonstrates that eBPF is a powerful and underexplored attack
+vector. The framework generates real, loadable BPF bytecode for 10
+distinct attack techniques, provides evasion capabilities against
+the three major eBPF security tools (Falco, Tetragon, Tracee), and
+includes forensic detection capabilities for blue team assessment.
+
+Key contributions:
+  1. First comprehensive open-source eBPF offensive toolkit, to our knowledge, generating real bytecode
+  2. io_uring evasion technique that bypasses all tracepoint monitoring
+  3. Security tool map corruption attack for rule-level disabling
+  4. Static forensic analyzer with 7 helper patterns and MITRE mapping
+  5. Verifier bypass pattern database with 6 CVEs and generators
+  6. ELF generation pipeline producing loadable BPF objects
+
+BPFStrike is intended for authorized security testing, red team
+operations, and security research. It enables defenders to validate
+whether their BPF-based security tools actually detect real-world
+BPF attack patterns.

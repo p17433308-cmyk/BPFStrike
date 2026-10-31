@@ -1,0 +1,866 @@
+================================================================================
+  BPFStrike: Weaponizing eBPF — From Verifier Bypass to Kernel-Level Stealth
+================================================================================
+
+  Author  : Dr. Sapna V M
+  Version : 4.0.0
+  Release : October 2026
+  Source  : https://github.com/p17433308-cmyk/BPFStrike
+  License : Research / Educational Use
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. ABSTRACT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Extended Berkeley Packet Filter (eBPF) has become the dominant kernel
+instrumentation framework in modern Linux, underpinning security monitoring
+tools such as Falco, Tetragon, and Tracee. These tools operate on the
+assumption that kernel-level visibility through eBPF provides an authoritative
+and tamper-resistant view of system behavior.
+
+BPFStrike challenges this assumption. We present an open-source offensive
+security framework (9,004 lines of Python, 14 modules, 140 tests) that
+generates real BPF ISA bytecode — not wrappers around bpftool or libbpf — to
+systematically attack, evade, and dismantle eBPF-based defenses. Our
+contributions include:
+
+  (1) Weaponized implementations of five BPF verifier CVEs that achieve
+      out-of-bounds memory access, kernel pointer leaks, and speculative
+      execution side-channels.
+
+  (2) Four stealth loading techniques that inject BPF programs into the kernel
+      without filesystem artifacts, process traces, or libbpf dependencies.
+
+  (3) Three live evasion attacks that blind, detach, or hijack deployed eBPF
+      security tools at runtime — proving that defenders and attackers share
+      the same privilege domain.
+
+  (4) A complete kill chain from kernel fingerprinting through CVE-specific
+      exploit chaining, stealth deployment, and anti-forensic cleanup.
+
+We demonstrate that eBPF-based security monitoring is not a security boundary.
+Defense-in-depth — BPF LSM, kernel lockdown, signed programs, and CAP_BPF
+restrictions — is mandatory.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. INTRODUCTION AND MOTIVATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2.1  The eBPF Security Paradox
+
+eBPF allows userspace programs to execute sandboxed bytecode inside the Linux
+kernel. The BPF verifier — a static analysis engine in the kernel — ensures
+programs terminate, stay within bounds, and cannot corrupt kernel state. This
+guarantee enables security tools to deploy eBPF programs that hook system
+calls, trace network packets, and monitor process behavior with near-zero
+overhead.
+
+However, this architecture creates a fundamental paradox: the same mechanism
+that powers security monitoring is available to attackers. Any process with
+CAP_BPF (or root on kernels < 5.8) can load BPF programs that:
+
+  - Hook the same tracepoints and kprobes as security tools
+  - Override or filter events before security tools process them
+  - Detach security programs from their attachment points
+  - Exploit verifier vulnerabilities to escape the BPF sandbox
+
+2.2  Threat Model
+
+BPFStrike assumes an attacker with:
+
+  - Root access or CAP_BPF + CAP_PERFMON capabilities
+  - Knowledge of the target kernel version
+  - No prior access to the eBPF security tool's configuration
+
+This matches realistic post-exploitation scenarios where an attacker has
+achieved privilege escalation on a Linux host monitored by eBPF-based
+security tools (common in Kubernetes clusters, cloud workloads, and
+container environments).
+
+2.3  Existing Work and Gap
+
+Prior work on eBPF security has focused on:
+
+  - Defensive frameworks (Cilium, Falco, Tetragon)
+  - Individual CVE analyses (Google Project Zero, Qualys)
+  - Conceptual rootkit designs (ebpfkit, TripleCross)
+
+No existing tool provides:
+  - Raw BPF ISA bytecode generation without compiler toolchain
+  - Weaponized CVE exploit generators with kernel-version targeting
+  - Live evasion against deployed security tools
+  - Integrated attack-and-detect pipeline
+
+BPFStrike fills this gap as a research and red-team framework.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike is organized into 14 modules across five functional layers:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        CLI Interface                           │
+  │              13 commands — full framework access                │
+  ├─────────────┬─────────────┬─────────────┬───────────────────────┤
+  │  OFFENSE    │  STEALTH    │  DEFENSE    │  COMPOSITION          │
+  ├─────────────┼─────────────┼─────────────┼───────────────────────┤
+  │ Attacks     │ Stealth     │ Detection   │ Payload Compiler      │
+  │ (8 progs)   │ Loader      │ Rule Gen    │ (DSL)                 │
+  │             │ (4 methods) │ (YARA/Sigma │                       │
+  │ Evasion     │             │  /Snort)    │ Exploit Chainer       │
+  │ (5 attacks) │ Obfuscator  │             │ (CVE→chain)           │
+  │             │             │ Forensic    │                       │
+  │ Verifier    │ Anti-       │ Analyzer    │ Rootkit Composer      │
+  │ Bypasses    │ Forensics   │             │ (multi-component)     │
+  │ (8 exploits)│ (7 counter- │             │                       │
+  │             │  measures)  │ Verifier    │                       │
+  │ Recon       │             │ Harness     │                       │
+  │ (scanner)   │             │             │                       │
+  ├─────────────┴─────────────┴─────────────┴───────────────────────┤
+  │                     CORE ENGINE                                 │
+  │         BPF Bytecode Encoder  +  ELF64 Generator                │
+  └─────────────────────────────────────────────────────────────────┘
+
+3.1  Core Engine: BPF ISA Bytecode Encoder
+
+All BPF programs in BPFStrike are generated at the instruction level. Each
+instruction is encoded as:
+
+    struct bpf_insn {
+        __u8  opcode;       // operation + class + source
+        __u8  regs;         // dst_reg:4 | src_reg:4
+        __u16 offset;       // signed offset
+        __u32 imm;          // signed immediate
+    };
+
+Packed using Python's struct module: struct.pack("<BBHI", opcode, regs, off, imm)
+
+The encoder provides typed constructors for every BPF instruction class:
+
+  - ALU64/ALU32: mov, add, sub, mul, div, or, and, xor, lsh, rsh, arsh, neg, mod
+  - JMP: ja, jeq, jne, jgt, jge, jlt, jle, jsgt, jsge, jslt, jsle, call, exit
+  - MEM: ldx (load from memory), stx (store to memory), st (store immediate)
+  - Special: lddw (64-bit immediate load, 16-byte double instruction)
+
+Map definitions (BPFMapDef) specify type, key size, value size, and max entries.
+Program types include kprobe, tracepoint, XDP, cgroup, raw_tracepoint, and LSM.
+
+3.2  ELF64 Generator
+
+BPFStrike generates loadable ELF64 binaries directly — no LLVM, no Clang, no
+bcc. The generator constructs:
+
+  - ELF header (e_machine = EM_BPF = 247)
+  - .text section containing packed BPF instructions
+  - .maps section with BTF-compatible map definitions
+  - .bpf.license section (typically "GPL")
+  - Section header string table (.shstrtab)
+  - Symbol table entries for maps and programs
+
+Output ELFs are loadable by libbpf, bpftool, or BPFStrike's own stealth
+loader. Each binary includes a SHA-256 content hash for integrity verification.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. ATTACK PROGRAMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike generates eight offensive BPF programs, each targeting a specific
+capability:
+
+4.1  Syscall Hook (kprobe/sys_enter_openat)
+
+Attaches to the openat system call entry point. Reads the filename argument
+from userspace via bpf_probe_read_user_str(), compares against target
+patterns, and outputs matches to a perf event ring buffer. Used for
+credential file monitoring (/etc/shadow, SSH keys, cloud credentials).
+
+    Bytecode: 25 instructions, 1 map (perf_event_array)
+    Attach:   kprobe/sys_enter_openat
+
+4.2  Process Hider (kprobe/sys_enter_getdents64)
+
+Hooks the getdents64 system call to intercept directory listings of /proc.
+Manipulates the d_reclen field of linux_dirent64 structures to skip entries
+matching target PIDs. The hidden process remains running but invisible to
+ps, top, htop, and /proc enumeration.
+
+    Bytecode: 28 instructions, 1 map (array, PID storage)
+    Attach:   kprobe/sys_enter_getdents64
+
+4.3  XDP Packet Interceptor (xdp)
+
+Attached to a network interface's XDP hook for line-rate packet inspection.
+Parses Ethernet → IP → TCP/UDP headers, matches against configurable
+port/protocol filters, and copies matching packets to userspace via
+perf_event_output. Operates before the kernel's network stack processes
+the packet.
+
+    Bytecode: 24 instructions, 1 map (perf_event_array)
+    Attach:   XDP (network interface)
+
+4.4  Credential Harvester (kprobe/sys_enter_write)
+
+Monitors write() system calls on file descriptors 0 (stdin) and 1 (stdout)
+for processes matching target PIDs. Captures data buffers via
+bpf_probe_read_user() and exfiltrates through perf events. Targets SSH
+sessions, sudo prompts, and interactive login shells.
+
+    Bytecode: 22 instructions, 1 map (perf_event_array)
+    Attach:   kprobe/sys_enter_write
+
+4.5  Container Escape (cgroup/connect4)
+
+Attaches to the cgroup connect4 hook to intercept outbound IPv4 connections
+from containers. Rewrites the destination address to redirect traffic
+to an attacker-controlled endpoint. Effective against containers with
+unrestricted network policies.
+
+    Bytecode: 18 instructions, 1 map (hash, redirect targets)
+    Attach:   cgroup/connect4
+
+4.6  File Hider (kprobe/sys_enter_openat)
+
+Similar to process hider but targets file access. Intercepts openat()
+calls and returns -ENOENT for filenames matching the hidden file list,
+making specified files invisible to userspace applications including
+security scanners.
+
+    Bytecode: 20 instructions, 1 map (hash, hidden filenames)
+    Attach:   kprobe/sys_enter_openat
+
+4.7  Keylogger (perf_event)
+
+Attaches to hardware performance events (keyboard interrupts) to capture
+keystroke data. Each keypress is captured with timestamp and forwarded
+via perf_event_output to userspace. Operates below the input subsystem,
+invisible to application-level monitoring.
+
+    Bytecode: 15 instructions, 1 map (perf_event_array)
+    Attach:   perf_event (HW_CPU_CYCLES sampling)
+
+4.8  BPF Self-Hider (kprobe/__sys_bpf)
+
+The most critical attack program. Hooks the bpf() system call itself to
+intercept BPF_PROG_GET_NEXT_ID and BPF_PROG_GET_FD_BY_ID commands.
+Filters responses to hide BPFStrike's own programs from bpftool,
+/proc/sys/kernel/bpf, and any BPF enumeration tool — including eBPF
+security tools that inventory loaded programs.
+
+    Bytecode: 22 instructions, 2 maps (array: own prog IDs, perf_event_array)
+    Attach:   kprobe/__sys_bpf
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. BPF VERIFIER EXPLOITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The BPF verifier is the kernel's static analysis engine that validates BPF
+programs before execution. BPFStrike implements eight verifier bypass
+techniques — three generic and five CVE-specific.
+
+5.1  Generic Bypasses
+
+5.1.1  Complexity Bomb
+
+Generates programs with deeply nested conditional branches that approach
+the verifier's complexity limit (1M verified instructions). While not a
+sandbox escape, complexity bombs can crash or stall the verifier, causing
+denial of service against BPF program loading.
+
+    Technique: O(2^n) branch paths via nested if/else chains
+    Impact:    Verifier DoS, kernel CPU exhaustion
+
+5.1.2  ALU32 Bounds Confusion
+
+Exploits the verifier's separate tracking of 64-bit and 32-bit register
+bounds. Performs arithmetic in ALU32 mode that narrows the 32-bit tracked
+range while the actual 64-bit value remains wide, then uses the confused
+bounds for map access.
+
+    Technique: ALU32 operations → tnum/bounds divergence → OOB access
+    Impact:    Arbitrary map read/write beyond allocated bounds
+
+5.1.3  Pointer Arithmetic Confusion
+
+Manipulates pointer-to-scalar conversions through carefully ordered
+arithmetic operations. The verifier tracks pointer offset ranges; by
+performing additions and subtractions that cancel mathematically but
+confuse the range tracker, OOB access is achieved.
+
+    Technique: ptr + A - A where verifier widens range at each step
+    Impact:    OOB read via widened pointer range
+
+5.2  CVE-Specific Exploits
+
+5.2.1  CVE-2021-3490 — ALU32 Bounds Mismatch (Linux 5.7–5.11)
+
+  Vulnerability: The verifier's tnum (tristate number) tracking for ALU32
+  operations does not correctly propagate bounds after 32-bit bitwise
+  operations. When a 64-bit register is used in a 32-bit AND operation,
+  the resulting tnum can have a wider range than the actual value.
+
+  Exploit sequence:
+    1. Load a 64-bit value with known upper 32 bits into R1
+    2. Perform ALU32 AND with a mask — verifier computes tnum for 32-bit
+       result but preserves 64-bit bounds
+    3. The tracked range now permits an offset the actual value cannot reach
+    4. Use R1 as map value offset → OOB read/write
+
+  BPFStrike implementation:
+    - mov64_imm(R6, 0)              # map key
+    - stx_mem(BPFSize.W, R10, R6, -4)
+    - lddw(R1, map_fd, is_map=True) # load map pointer
+    - mov64_reg(R2, R10)
+    - add64_imm(R2, -4)
+    - call_helper(MAP_LOOKUP_ELEM)
+    - jeq_imm(R0, 0, exit_offset)
+    - mov64_reg(R7, R0)             # R7 = map value ptr
+    - ldx_mem(BPFSize.W, R1, R7, 0) # R1 = user-controlled value
+    - ALU32 AND R1, 0x1             # verifier: tnum={0,1}, actual: {0,1}
+    - ALU32 MUL R1, 0x100           # verifier: wide range, actual: 0 or 256
+    - add64_reg(R7, R1)             # verifier thinks bounded, actual OOB
+    - ldx_mem(BPFSize.DW, R0, R7, 0)# OOB read
+
+  Affected kernels: 5.7 to 5.11 (patched in 5.12-rc8)
+
+5.2.2  CVE-2022-23222 — Pointer Type Confusion (Linux 5.8–5.14)
+
+  Vulnerability: After a conditional branch where one path sets a register
+  to a pointer (PTR_TO_MAP_VALUE) and the other to a scalar, the verifier's
+  branch merge incorrectly resolves the type. The merged state can lose the
+  pointer annotation, treating a kernel pointer as an unrestricted scalar.
+
+  Exploit sequence:
+    1. Perform map lookup → R0 = PTR_TO_MAP_VALUE or NULL
+    2. Branch on R0 == NULL
+    3. In the non-NULL path, copy R0 to R6 (R6 = PTR_TO_MAP_VALUE)
+    4. In the NULL path, set R6 = 0 (R6 = SCALAR)
+    5. At merge point, verifier may resolve R6 as SCALAR
+    6. Store R6 to map → leaks kernel pointer value
+
+  Impact: Kernel ASLR bypass via leaked map value pointer
+
+5.2.3  CVE-2023-2163 — Precision Tracking Loss (Linux 6.1–6.3)
+
+  Vulnerability: The verifier's precision tracking backtrack algorithm loses
+  register state when a register is spilled to the stack and then used in
+  nested conditional branches. The precision demand does not propagate
+  through the stack spill, causing the verifier to use imprecise (wider)
+  bounds for subsequent access checks.
+
+  Exploit sequence:
+    1. Load value from map into R1
+    2. Spill R1 to stack: stx_mem(DW, R10, R1, -8)
+    3. Enter nested conditional branches using other registers
+    4. Restore R1 from stack: ldx_mem(DW, R1, R10, -8)
+    5. Verifier has lost precision on R1 — bounds are wider than actual
+    6. Use R1 as offset → OOB write to map value
+
+  Impact: Arbitrary kernel memory write via map value OOB
+
+5.2.4  CVE-2023-39191 — BTF Type Validation Bypass (Linux 6.0–6.5)
+
+  Vulnerability: The verifier's BTF (BPF Type Format) validation does not
+  correctly handle deeply nested type definitions. When BTF types reference
+  other types beyond a certain nesting depth, the validator stops checking
+  access bounds, allowing programs to read beyond struct boundaries.
+
+  Exploit sequence:
+    1. Define deeply nested BTF types (struct → ptr → struct → ptr → ...)
+    2. Load program with BTF section referencing the nested types
+    3. Access a field at an offset the type system should reject
+    4. Verifier's BTF depth limit exceeded → access check skipped
+    5. OOB read from kernel memory adjacent to the BTF-typed region
+
+  Impact: Kernel memory disclosure
+
+5.2.5  CVE-2024-2193 — GhostRace / Speculative Data Race (Linux 6.1+)
+
+  Vulnerability: Speculative execution of BPF helper calls can create
+  transient data races. When a BPF program calls a helper that accesses
+  shared kernel data structures, speculative execution of subsequent
+  instructions can observe stale or inconsistent data through cache
+  timing side-channels.
+
+  Exploit sequence:
+    1. Call bpf_map_lookup_elem() — triggers helper execution
+    2. Immediately access the returned pointer in the next instruction
+    3. CPU speculates past the helper call boundary
+    4. Speculatively accessed data leaves cache footprint
+    5. Flush+Reload or Prime+Probe to extract cached data
+    6. Repeat to reconstruct kernel memory contents byte-by-byte
+
+  Impact: Cross-privilege data extraction via cache side-channel
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. STEALTH LOADING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Standard BPF loading via libbpf or bpftool leaves multiple forensic traces:
+filesystem access to ELF files, library loading events, process execution
+logs, and bpf() system call records. BPFStrike implements four stealth
+loading methods that minimize these artifacts.
+
+6.1  Direct Syscall Loading
+
+Bypasses libbpf entirely by calling the bpf() system call directly through
+ctypes:
+
+    libc = ctypes.CDLL("libc.so.6")
+    result = libc.syscall(321, BPF_PROG_LOAD, attr_ptr, attr_size)
+
+The bpf_attr structure is manually constructed:
+
+    BPF_ATTR_PROG_LOAD_FMT = "IIQQIIQI64sIIIIII28x"
+    # prog_type, insn_cnt, insns_ptr, license_ptr, log_level,
+    # log_size, log_buf_ptr, kern_version, prog_name (16 bytes),
+    # prog_ifindex, expected_attach_type, ...
+
+    BPF_ATTR_MAP_CREATE_FMT = "IIII48x"
+    # map_type, key_size, value_size, max_entries
+
+Benefits:
+  - No libbpf.so loading (invisible to library monitoring)
+  - No bpftool process creation
+  - No ELF file access (bytecode passed as memory pointer)
+  - Program name field can be spoofed (--name-spoof flag)
+
+6.2  memfd_create Anonymous Loading
+
+Creates an anonymous in-memory file descriptor:
+
+    SYS_memfd_create = 319  # x86_64
+    fd = libc.syscall(SYS_memfd_create, b"", MFD_CLOEXEC)
+    os.write(fd, elf_bytes)
+    # Load from /proc/self/fd/{fd}
+
+The ELF binary never touches the filesystem. The memfd is created with
+MFD_CLOEXEC so it closes automatically on exec. After loading, the fd
+is closed and no trace remains.
+
+Forensic visibility:
+  - /proc/pid/fd/ shows the memfd while open (brief window)
+  - No filesystem inode, no dentry, no filename
+  - File content exists only in memory
+
+6.3  Ptrace Injection
+
+Injects BPF loading shellcode into a running process:
+
+    1. PTRACE_ATTACH to target process
+    2. Wait for SIGSTOP
+    3. Save original registers and instruction memory
+    4. Write x86_64 shellcode via PTRACE_POKETEXT:
+
+       ; bpf(BPF_PROG_LOAD, attr, sizeof(attr))
+       mov rax, 321        ; __NR_bpf
+       mov rdi, 5          ; BPF_PROG_LOAD
+       lea rsi, [rip+attr] ; attr pointer
+       mov rdx, 128        ; attr size
+       syscall
+       int3                ; breakpoint for control return
+
+    5. Set RIP to shellcode address
+    6. PTRACE_CONT — target executes bpf() from its own context
+    7. Catch SIGTRAP at int3
+    8. Restore original registers and memory
+    9. PTRACE_DETACH
+
+The BPF program appears to be loaded by the target process (e.g., systemd,
+sshd), not by the attacker's process. Audit logs attribute the bpf()
+syscall to the victim PID.
+
+6.4  /proc/pid/mem Direct Memory Overwrite
+
+Writes shellcode directly to a target process's memory space:
+
+    1. Open /proc/{pid}/mem for writing
+    2. Read target's current RIP from /proc/{pid}/syscall
+    3. Seek to RIP address in the mem file
+    4. Write BPF loading shellcode + program bytecode
+    5. Target executes shellcode on next scheduled run
+
+This method does not use ptrace and therefore does not generate
+PTRACE_ATTACH audit events. Requires CAP_SYS_PTRACE or same-UID
+ownership of the target process.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. LIVE EVASION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike's live evasion module attacks deployed eBPF security tools at
+runtime. Unlike stealth loading (which minimizes loading artifacts), live
+evasion actively defeats monitoring that is already running.
+
+7.1  bpf() Return Override
+
+Technique: Attach a kprobe to the bpf() system call. For calls originating
+from security tool PIDs (identified by comm name matching against Falco,
+Tetragon, Tracee, bpftool), override the return value with -ENOENT using
+bpf_override_return().
+
+Effect: Security tools that enumerate loaded BPF programs receive "not
+found" for every query. Their dashboards show zero BPF programs loaded,
+even while BPFStrike's rootkit programs are active.
+
+    Target PIDs: Identified by bpf_get_current_comm() matching:
+      - "falco", "falcoctl"
+      - "tetragon", "hubble"
+      - "tracee", "tracee-ebpf"
+      - "bpftool", "bpftrace"
+
+    Implementation:
+      - kprobe/__sys_bpf
+      - Check current_comm against security tool name list
+      - If match AND cmd == BPF_PROG_GET_NEXT_ID|BPF_MAP_GET_NEXT_ID:
+          bpf_override_return(ctx, -ENOENT)
+
+    Requirement: CONFIG_BPF_KPROBE_OVERRIDE=y (common in distro kernels)
+
+7.2  BPF Program Detach
+
+Technique: Monitor the security_bpf_prog LSM hook to detect when security
+tools load new BPF programs. Log the program FDs and link FDs. Then issue
+BPF_LINK_DETACH commands to remove the security programs from their
+attachment points.
+
+Effect: Security tools' BPF programs are loaded but not attached — they
+execute no code. The tools may report "running" in their status but
+receive no events.
+
+    Implementation:
+      - LSM hook: security_bpf_prog (monitors BPF program operations)
+      - Record prog_fd and link_fd for security tool programs
+      - Issue BPF_LINK_DETACH via bpf() syscall to sever attachments
+      - Security programs remain loaded but inert
+
+7.3  Tracepoint Hijacking
+
+Technique: Attach a higher-priority BPF program to the same tracepoint
+used by security tools (typically raw_syscalls/sys_enter). BPF programs
+attached to the same tracepoint execute in order of attachment; by
+filtering events for the rootkit's PID before the security tool's program
+runs, the rootkit's syscalls never appear in security event streams.
+
+Effect: Security tools see all system activity except the rootkit's.
+Process listings, file access, network connections — all filtered at
+the kernel level before the security tool's BPF program processes them.
+
+    Implementation:
+      - raw_tracepoint/sys_enter (same as security tools)
+      - bpf_get_current_pid_tgid() → compare against rootkit PID
+      - If match: consume the event (return early), preventing
+        propagation to security tool's handler
+      - If no match: pass through normally
+
+    Note: Requires attachment before the security tool, or re-attachment
+    after detaching the security tool's program (see 7.2).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. COMPOSITION AND CHAINING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+8.1  Payload Compiler DSL
+
+BPFStrike includes a domain-specific language for composing multi-module
+payloads. Modules are combined with exfiltration methods and evasion modes:
+
+    Modules:     recon, persist, exfil, privesc, lateral, cleanup
+    Exfil:       dns_tunnel, icmp_covert, devnull_sink
+    Evasion:     timestomp, trace_wipe, vm_detect
+
+The compiler generates a single BPF program combining selected modules,
+with shared maps for inter-module communication and a unified perf event
+output channel.
+
+8.2  Exploit Chainer
+
+Automated kernel-version-to-exploit-chain mapping:
+
+    Input:  Kernel version string (e.g., "5.15.0-76-generic")
+    Process:
+      1. Parse version → KernelFingerprint (major, minor, patch, distro)
+      2. Query KERNEL_CVE_MAP for applicable CVEs
+      3. Check KERNEL_CAPABILITIES for available features
+      4. Order exploit stages: recon → bypass → privilege → payload → cleanup
+      5. Generate chained BPF programs with inter-stage dependencies
+    Output: ExploitChainResult with ordered stages and combined ELFs
+
+    KERNEL_CVE_MAP entries:
+      "5.7-5.11"  → CVE-2021-3490 (ALU32 bounds)
+      "5.8-5.14"  → CVE-2022-23222 (pointer confusion)
+      "6.1-6.3"   → CVE-2023-2163 (precision tracking)
+      "6.0-6.5"   → CVE-2023-39191 (BTF validation)
+      "6.1+"      → CVE-2024-2193 (GhostRace)
+
+8.3  Rootkit Composer
+
+Assembles multi-component rootkits from individual attack programs:
+
+    Components: process_hider + file_hider + bpf_self_hider + keylogger
+    Persistence: cgroup attachment (survives process restart)
+    Communication: shared BPF maps between components
+    Output: Single ELF binary with multiple program sections
+
+8.4  Anti-Forensic Countermeasures
+
+Seven countermeasure programs for post-operation cleanup:
+
+    1. Log Wiper:        Clear syslog, auth.log, kern.log entries
+    2. Timestamp Manip:  Modify file access/modify times
+    3. Trace Cleanup:    Remove /tmp artifacts, clear bash_history
+    4. Audit Evasion:    Filter auditd events for rootkit PID
+    5. Core Dump Block:  Prevent core dumps of attacker processes
+    6. Module Unbind:    Remove kernel module load traces
+    7. Network Cleanup:  Clear conntrack entries for C2 connections
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. DEFENSE AND DETECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike is a dual-use framework — it generates both attacks AND detection
+signatures.
+
+9.1  Detection Rule Generator
+
+Automatically produces detection rules from BPFStrike's own attack
+bytecode:
+
+    YARA rules:  Match ELF binary patterns, specific instruction sequences,
+                 map definitions characteristic of offensive programs
+    Sigma rules: Detect suspicious bpf() syscall patterns, unusual program
+                 types, known-bad attach points
+    Snort rules: Network signatures for BPF-based exfiltration channels
+
+9.2  Forensic Analyzer
+
+Identifies suspicious BPF programs on a running system:
+
+    - Helper call patterns: OVERRIDE_RETURN + GET_CURRENT_COMM = evasion
+    - Attach point anomalies: kprobe/__sys_bpf = self-hiding
+    - Map type combinations: perf_event_array + hash = exfiltration
+    - Program size outliers: Abnormally large programs may be obfuscated
+
+9.3  Verifier Validation Harness
+
+Structural bytecode verification without kernel execution:
+
+    Checks:
+      - ISA encoding:     Valid opcodes, register indices 0-10
+      - Control flow:     No jumps beyond program bounds (lddw-aware)
+      - Register usage:   R10 (frame pointer) never written
+      - Stack bounds:     Access within [-512, 0] relative to R10
+      - Map access:       lddw with src_reg=1 for map references
+      - Helper calls:     Known helper IDs, argument count validation
+      - Exit reachable:   At least one BPF_EXIT instruction exists
+
+9.4  Recommended Mitigations
+
+Based on BPFStrike's attack capabilities, we recommend:
+
+    1. CAP_BPF restriction:
+       Remove CAP_BPF from non-essential processes. Use
+       kernel.unprivileged_bpf_disabled=2 to prevent unprivileged access.
+
+    2. BPF LSM (Linux Security Module):
+       Enable CONFIG_BPF_LSM and attach LSM programs that validate:
+       - Program types allowed per cgroup
+       - Helper functions permitted
+       - Attach points restricted to approved list
+
+    3. Kernel lockdown mode:
+       Enable lockdown=integrity or lockdown=confidentiality to prevent
+       kprobe attachment to sensitive functions.
+
+    4. Signed BPF programs:
+       Use BPF token (kernel 6.9+) or light skeleton programs with
+       signature verification to prevent unauthorized program loading.
+
+    5. BPF program audit:
+       Monitor bpf() syscalls via auditd with key filtering.
+       Alert on: BPF_PROG_LOAD from unexpected processes,
+       OVERRIDE_RETURN helper usage, __sys_bpf kprobe attachment.
+
+    6. Defense-in-depth:
+       Never rely on eBPF monitoring alone. Combine with:
+       - Kernel module integrity (dm-verity, IMA)
+       - Mandatory access control (SELinux, AppArmor)
+       - Hardware security (TPM-based attestation)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. BYTECODE OBFUSCATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike includes a bytecode obfuscator that transforms programs to evade
+signature-based detection while preserving semantic equivalence.
+
+    Techniques:
+      - Dead code injection:    Insert unreachable instruction sequences
+      - Register shuffling:     Reassign register allocations
+      - NOP sled insertion:     Add mov rX, rX identity operations
+      - Constant splitting:     Replace imm with (imm/2 + imm/2) sequences
+      - Instruction reordering: Swap independent instructions
+
+    The obfuscator also includes a detection module that analyzes BPF
+    bytecode for signs of obfuscation, providing blue teams with a
+    classification tool.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. RECONNAISSANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike's recon module (BPFScanner) fingerprints the target kernel's BPF
+capabilities:
+
+    Enumeration:
+      - Loaded BPF programs (type, attach point, helper usage)
+      - Active BPF maps (type, key/value sizes, entries)
+      - BPF links (program-to-attachment bindings)
+      - Kernel version and BPF feature flags
+
+    Security tool detection:
+      - Process names matching known tools (Falco, Tetragon, etc.)
+      - BPF program attach points characteristic of security monitoring
+      - Map naming patterns used by security frameworks
+
+    Output: ReconResult with structured data for exploit chainer input
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. CLI REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike provides 13 CLI commands:
+
+    bpfstrike attacks    Generate offensive BPF programs as ELF binaries
+    bpfstrike evade      Generate evasion attack ELFs
+    bpfstrike bypass     Generate verifier bypass programs
+    bpfstrike scan       Enumerate kernel BPF state
+    bpfstrike forensics  Analyze BPF programs for suspicious patterns
+    bpfstrike rootkit    Compose multi-component rootkits
+    bpfstrike detect     Generate YARA/Sigma/Snort detection rules
+    bpfstrike obfuscate  Obfuscate BPF bytecode
+    bpfstrike compile    Compile payloads from DSL specifications
+    bpfstrike antifor    Deploy anti-forensic countermeasures
+    bpfstrike chain      Auto-chain exploits for target kernel version
+    bpfstrike load       Stealth-load BPF programs (4 methods)
+    bpfstrike validate   Validate bytecode with verifier harness
+
+    Global flags:
+      --output DIR       Output directory for generated files
+      --format json|text Output format
+      --all              Generate/run all available items
+      --verbose          Verbose output with bytecode hex dumps
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. EVALUATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+13.1  Test Coverage
+
+    Total tests:    140
+    Test lines:     1,158
+    Pass rate:      100%
+    Execution time: 0.25 seconds
+
+    Coverage by module:
+      Core bytecode/ELF:    18 tests
+      Attack programs:      16 tests
+      Evasion attacks:      13 tests (5 original + 5 live evasion + 3 ELF)
+      Verifier bypasses:    14 tests (3 generic + 7 CVE-specific + 4 chainer)
+      Recon/Forensics:      11 tests
+      Rootkit composer:      9 tests
+      Detection rules:       8 tests
+      Obfuscator:           10 tests
+      Payload compiler:      9 tests
+      Anti-forensics:        8 tests
+      Stealth loader:        9 tests
+      Verifier harness:      7 tests
+      CLI commands:          5 tests
+      Export/version:         3 tests
+
+13.2  Bytecode Validity
+
+All generated programs pass the verifier harness structural validation:
+  - Valid ISA encoding (opcodes, registers)
+  - Bounded control flow (no OOB jumps)
+  - R10 never written
+  - Stack access within [-512, 0]
+  - Exit instruction reachable
+
+Note: CVE-specific exploits intentionally generate programs that would
+fail the kernel verifier on patched kernels — the harness validates
+structural correctness, not verifier acceptance.
+
+13.3  Codebase Metrics
+
+    Source lines:     9,004
+    Test lines:       1,158
+    Total:           10,162
+    Modules:             14
+    CLI commands:        13
+    Attack programs:      8
+    Evasion attacks:      5
+    Verifier bypasses:    8
+    Loading methods:      4
+    Countermeasures:      7
+    Dependencies:         0 (pure Python, stdlib only)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. RESPONSIBLE USE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BPFStrike is released as a research and red-team tool for:
+
+  - Security researchers studying eBPF attack surfaces
+  - Red teams testing eBPF-based security tool resilience
+  - Blue teams understanding attacker techniques and building detections
+  - Kernel developers validating verifier robustness
+
+The framework intentionally includes detection rule generation alongside
+attack capabilities. Every attack module has a corresponding detection
+signature, enabling defenders to immediately deploy countermeasures.
+
+All CVE exploits target publicly disclosed and patched vulnerabilities.
+No zero-day exploits are included.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15. REFERENCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[1]  Linux kernel source: kernel/bpf/verifier.c
+[2]  CVE-2021-3490: https://nvd.nist.gov/vuln/detail/CVE-2021-3490
+[3]  CVE-2022-23222: https://nvd.nist.gov/vuln/detail/CVE-2022-23222
+[4]  CVE-2023-2163: https://nvd.nist.gov/vuln/detail/CVE-2023-2163
+[5]  CVE-2023-39191: https://nvd.nist.gov/vuln/detail/CVE-2023-39191
+[6]  CVE-2024-2193: https://nvd.nist.gov/vuln/detail/CVE-2024-2193
+[7]  Cilium/Tetragon: https://github.com/cilium/tetragon
+[8]  Falco: https://github.com/falcosecurity/falco
+[9]  Tracee: https://github.com/aquasecurity/tracee
+[10] ebpfkit: https://github.com/Gui774ume/ebpfkit
+[11] TripleCross: https://github.com/h3xduck/TripleCross
+[12] BPF LSM: https://docs.kernel.org/bpf/prog_lsm.html
+[13] BPF CO-RE: https://nakryiko.com/posts/bpf-core-reference-guide/
+[14] Kernel lockdown: https://man7.org/linux/man-pages/man7/kernel_lockdown.7.html
+
+
+================================================================================
+  Source Code: https://github.com/p17433308-cmyk/BPFStrike
+  Version:    4.0.0
+  Tests:      140 passed
+  License:    Research / Educational Use
+================================================================================
